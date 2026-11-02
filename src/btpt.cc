@@ -2,10 +2,12 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <time.h>
 #include <stdlib.h>
 #include <cstddef>
 #include <cstdlib>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 
 #include <linux/uinput.h>
@@ -21,10 +23,10 @@
 #include <QThread>
 
 #include "btpt.h"
+#include "capture.h"
+#include "config.h"
 #include "eventcodes.h"
-
-/* Directory in which to look for device configuration */
-#define BTPT_DIR "/mnt/onboard/.btpt/"
+#include "settings.h"
 
 /* Stop Bluetooth heartbeat after this many seconds of inactivity */
 #define BLUETOOTH_TIMEOUT (10*60)
@@ -39,20 +41,43 @@ static QObject *(*PowerManager_sharedInstance)();
 static int (*PowerManager_filter)(QObject *, QObject *, QEvent *);
 static QEvent::Type (*TimeEvent_eventType)();
 
-static void invokeMainWindowController(const char *method)
+static qint64 nowMs()
 {
-	QString name = QString();
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (qint64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static QWidget *currentView()
+{
 	void *mwc = MainWindowController_sharedInstance();
 	if (!mwc) {
 		nh_log("invalid MainWindowController");
-		return;
+		return NULL;
 	}
 	QWidget *cv = MainWindowController_currentView(mwc);
 	if (!cv) {
 		nh_log("invalid View");
+	}
+	return cv;
+}
+
+QWidget *nickelMainWindow()
+{
+	QWidget *cv = currentView();
+	if (cv) {
+		return cv->window();
+	}
+	return QApplication::activeWindow();
+}
+
+static void invokeMainWindowController(const char *method)
+{
+	QWidget *cv = currentView();
+	if (!cv) {
 		return;
 	}
-	name = cv->objectName();
+	QString name = cv->objectName();
 	if (name == "ReadingView") {
 		nh_log("%s", method);
 		if (!QMetaObject::invokeMethod(cv, method, Qt::QueuedConnection)) {
@@ -64,130 +89,135 @@ static void invokeMainWindowController(const char *method)
 	}
 }
 
-bool BluetoothPageTurner::addDevice(
-	const QString &name, const QString &uniq, const QString &handler)
+BluetoothPageTurner::BluetoothPageTurner()
+	: settingsOpen(false)
 {
-	int fd;
+	/* These live in the GUI thread, and their slots run there */
+	QObject::connect(
+		&inputWatcher, &QFileSystemWatcher::directoryChanged,
+		this, &BluetoothPageTurner::inputDirectoryChanged);
+	inputWatcher.addPath("/dev/input");
 
-	if (devices.contains(uniq)) {
-		return false;
+	QObject::connect(
+		&configWatcher, &QFileSystemWatcher::directoryChanged,
+		this, &BluetoothPageTurner::configChangedOnDisk);
+	QObject::connect(
+		&configWatcher, &QFileSystemWatcher::fileChanged,
+		this, &BluetoothPageTurner::configChangedOnDisk);
+
+	/* Watches can be lost, for example when the onboard storage is
+	 * unmounted for USB, so renew them now and then */
+	QObject::connect(
+		&rewatchTimer, &QTimer::timeout,
+		this, &BluetoothPageTurner::watchConfig);
+	rewatchTimer.start(30 * 1000);
+	watchConfig();
+}
+
+QList<RemoteInfo> BluetoothPageTurner::remotes()
+{
+	QMutexLocker locker(&mutex);
+	return remoteList;
+}
+
+void BluetoothPageTurner::setSettingsOpen(bool open)
+{
+	settingsOpen = open;
+}
+
+void BluetoothPageTurner::requestReload()
+{
+	QMutexLocker locker(&mutex);
+	configChanged = true;
+	wake.wakeAll();
+}
+
+void BluetoothPageTurner::inputDirectoryChanged(const QString &path)
+{
+	(void)path;
+	QMutexLocker locker(&mutex);
+	deviceChanges++;
+	wake.wakeAll();
+}
+
+void BluetoothPageTurner::configChangedOnDisk(const QString &path)
+{
+	(void)path;
+	watchConfig();
+	requestReload();
+}
+
+void BluetoothPageTurner::watchConfig()
+{
+	if (QFile::exists(BTPT_OPEN_SETTINGS)) {
+		QFile::remove(BTPT_OPEN_SETTINGS);
+		emit openSettings(QString());
 	}
 
-	/* Fall back to device name */
-	QFile cfg(BTPT_DIR + name);
+	if (!configWatcher.directories().contains(BTPT_DIR) &&
+	    QDir(BTPT_DIR).exists()) {
+		configWatcher.addPath(BTPT_DIR);
+	}
 
-	/* Look for case-insensitive Bluetooth address in BTPT_DIR */
-	QStringList list = QDir(BTPT_DIR).entryList();
-	for (int i = 0; i < list.size(); ++i) {
-		QString filename = list.at(i);
-		if (filename.toLower() == uniq.toLower()) {
-			cfg.setFileName(BTPT_DIR + filename);
+	/* Directory watches only see files being added and removed, so watch
+	 * each file for edits too.  Saving replaces a file, which drops its
+	 * watch, so this runs again after every change. */
+	QStringList files;
+	foreach (const QString &f, QDir(BTPT_DIR).entryList(QDir::Files)) {
+		QString path = BTPT_DIR + f;
+		if (!configWatcher.files().contains(path)) {
+			files << path;
 		}
 	}
+	if (!files.isEmpty()) {
+		configWatcher.addPaths(files);
+	}
+}
 
-	if (!cfg.open(QIODevice::ReadOnly | QIODevice::Text)) {
-		nh_log("unable to open %s%s",
-		       BTPT_DIR, cfg.fileName().toStdString().c_str());
-		return false;
+void BluetoothPageTurner::loadConfig(Device &device)
+{
+	bool exists;
+	QString path = configPath(device.name, device.uniq, &exists);
+	device.hasConfig = exists && device.cfg.load(path);
+	if (!device.hasConfig) {
+		device.cfg = Config();
+	}
+}
+
+void BluetoothPageTurner::addDevice(
+	const QString &name, const QString &uniq, const QString &handler)
+{
+	if (devices.contains(handler)) {
+		return;
 	}
 
 	QString path = "/dev/input/" + handler;
-	fd = open(path.toStdString().c_str(), O_RDONLY | O_NONBLOCK);
+	int fd = open(path.toLatin1().constData(), O_RDONLY | O_NONBLOCK);
 	if (fd < 0) {
-		nh_log("error opening /dev/input/%s",
-		       path.toStdString().c_str());
-		return false;
+		nh_log("error opening %s", qPrintable(path));
+		return;
 	}
 
-	/* Found a config file and a /dev/input handler, so configure device */
-	Device &device = devices[uniq];
+	/* Open every Bluetooth input device, even without a configuration,
+	 * so that the settings screen can set it up. */
+	Device &device = devices[handler];
 	device.fd = fd;
-	device.cfg.clear();
+	device.handler = handler;
+	device.uniq = uniq;
+	device.name = name;
+	loadConfig(device);
 
-	QByteArray text = cfg.readAll();
-	cfg.close();
-	QTextStream in(&text);
-
-	while (!in.atEnd()) {
-		/* Configuration file format is, one per line:
-		 *
-		 * METHOD TYPE CODE VALUE
-		 *
-		 * Invoke METHOD on MainWindowController when input event
-		 * matches TYPE, CODE, and VALUE.
-		 *
-		 * TYPE, CODE, and VALUE can be #defines from
-		 * <linux/input-event-codes.h>
-		 */
-
-		QString line = in.readLine();
-#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
-		QList<QString> parts = line.split(" ", Qt::SkipEmptyParts);
-#else
-		QList<QString> parts = line.split(" ", QString::SkipEmptyParts);
-#endif
-		if (parts.size() != 4) {
-			nh_log("invalid config line: %s",
-			       line.toStdString().c_str());
-			devices.remove(uniq);
-			return false;
-		}
-
-		struct input_event event = { 0 };
-		bool ok;
-
-		event.type = parseEventCode(&ok, parts[1]);
-		if (!ok) {
-			nh_log("invalid type: %s",
-			       parts[1].toStdString().c_str());
-			devices.remove(uniq);
-			return false;
-		}
-
-		event.code = parseEventCode(&ok, parts[2]);
-		if (!ok) {
-			nh_log("invalid code: %s",
-			       parts[2].toStdString().c_str());
-			devices.remove(uniq);
-			return false;
-		}
-
-		event.value = parseEventCode(&ok, parts[3]);
-		if (!ok) {
-			nh_log("invalid value: %s",
-			       parts[3].toStdString().c_str());
-			devices.remove(uniq);
-			return false;
-		}
-
-		QPair<struct input_event, QString> map(event, parts[0]);
-		device.cfg.append(map);
-	}
-
-	nh_log("acquired device %s: %s",
-	       handler.toStdString().c_str(),
-	       uniq.toStdString().c_str());
-
-	return true;
+	nh_log("acquired device %s: %s (%s)%s",
+	       qPrintable(handler), qPrintable(uniq), qPrintable(name),
+	       device.hasConfig ? "" : ", not configured");
 }
 
-void BluetoothPageTurner::directoryChanged(const QString &path)
+void BluetoothPageTurner::scanDevices()
 {
-	(void)path;
-	mutex.lock();
-	deviceChanges++;
-	newDevice.wakeAll();
-	mutex.unlock();
-}
-
-bool BluetoothPageTurner::scanDevices()
-{
-	bool devicesAdded = false;
-
 	QFile file("/proc/bus/input/devices");
 	if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
 		nh_log("error opening /proc/bus/input/devices");
-		return devicesAdded;
+		return;
 	}
 
 	nh_log("checking /proc/bus/input/devices for new devices");
@@ -205,6 +235,8 @@ bool BluetoothPageTurner::scanDevices()
 		QString type = line.section(": ", 0, 0);
 		if (type == "I") {
 			i = line.section(": ", 1);
+			u.clear();
+			n.clear();
 		}
 		else if (type == "U") {
 			/* Bluetooth address without the ':'s */
@@ -220,26 +252,102 @@ bool BluetoothPageTurner::scanDevices()
 		else if (type == "H") {
 			/* Skip if not Bluetooth device */
 			if (!i.startsWith("Bus=0005 ")) {
-				nh_log("skipping %s", i.toStdString().c_str());
 				continue;
 			}
 
-			/* Configure the device */
-			nh_log("found %s", i.toStdString().c_str());
 			QList<QString> handlers =
 				line.section("Handlers=", 1).split(" ");
-			foreach(const QString &handler, handlers) {
+			foreach (const QString &handler, handlers) {
 				if (handler.startsWith("event")) {
-					devicesAdded |=
-						addDevice(n, u, handler);
+					addDevice(n, u, handler);
 				}
 			}
 		}
 	}
 
 	nh_log("devices scanned");
+}
 
-	return devicesAdded;
+void BluetoothPageTurner::publishRemotes()
+{
+	QList<RemoteInfo> list;
+	QSet<QString> seen;
+	foreach (const Device &device, devices) {
+		QString key = device.uniq.isEmpty() ? device.name : device.uniq;
+		if (seen.contains(key)) {
+			continue;
+		}
+		seen.insert(key);
+		RemoteInfo info;
+		info.uniq = device.uniq;
+		info.name = device.name;
+		list.append(info);
+	}
+
+	mutex.lock();
+	remoteList = list;
+	mutex.unlock();
+
+	emit remotesChanged();
+}
+
+void BluetoothPageTurner::handleEvent(Device &device, const struct input_event &e)
+{
+	if (settingsOpen) {
+		if (e.type == EV_SYN) {
+			return;
+		}
+		int absMin = 0, absMax = 0;
+		if (e.type == EV_ABS) {
+			struct input_absinfo info;
+			if (ioctl(device.fd, EVIOCGABS(e.code), &info) == 0) {
+				absMin = info.minimum;
+				absMax = info.maximum;
+			}
+		}
+		emit inputEvent(device.uniq, device.name,
+		                e.type, e.code, e.value, absMin, absMax);
+		return;
+	}
+
+	if (!device.hasConfig) {
+		/* Offer to set up a new remote the first time it is used */
+		QString key = device.uniq.isEmpty() ? device.name : device.uniq;
+		if (!isNoise(e.type) && !prompted.contains(key)) {
+			prompted.insert(key);
+			nh_log("unconfigured input from %s", qPrintable(key));
+			emit unconfiguredInput(device.uniq, device.name);
+		}
+		return;
+	}
+
+	foreach (const Mapping &m, device.cfg.mappings) {
+		if (!m.matches(e.type, e.code, e.value)) {
+			continue;
+		}
+
+		/* Debounce per remote, across all of its handlers and
+		 * buttons, so one press can't turn two pages */
+		qint64 now = nowMs();
+		QString key = device.uniq.isEmpty() ? device.name : device.uniq;
+		int debounce = device.cfg.debounceMs;
+		if (debounce > 0 && lastFire.contains(key) &&
+		    now - lastFire[key] < debounce) {
+			nh_log("debounced %s", qPrintable(m.method));
+			continue;
+		}
+		lastFire[key] = now;
+
+		/* Update Bluetooth heartbeat time */
+		lastEvent = now;
+
+		/* Update PowerManager::timeLastUsed */
+		emit notify();
+
+		/* Invoke the configured method */
+		QByteArray method = m.method.toLatin1();
+		invokeMainWindowController(method.constData());
+	}
 }
 
 void BluetoothPageTurner::run()
@@ -247,48 +355,44 @@ void BluetoothPageTurner::run()
 	void *bluetoothHeartbeat = NULL;
 	fd_set rfds;
 	struct timeval tv;
-	struct timespec last_event = { 0 };
-	struct timespec now = { 0 };
 
 	nh_log("starting");
 
-	/* FileSystemWatcher will increment devicesChanges and wake us up when
-	 * /dev/input changes */
-	QObject::connect(
-		&watcher, &QFileSystemWatcher::directoryChanged,
-		this, &BluetoothPageTurner::directoryChanged);
-	watcher.addPath("/dev/input");
+	/* Pick up devices that connected before we started */
+	mutex.lock();
+	deviceChanges++;
+	mutex.unlock();
 
 	while (1) {
 		struct input_event e;
 		int ret;
 
-		/* Scan input devices for new devices */
+		/* Wait for something to do if there are no devices */
 		mutex.lock();
-		if (deviceChanges == 0 && devices.empty()) {
+		if (deviceChanges == 0 && !configChanged && devices.empty()) {
 			nh_log("waiting for input devices");
-			newDevice.wait(&mutex);
-			deviceChanges = 0;
-			mutex.unlock();
-			if (!scanDevices()) {
-				continue;
-			}
+			wake.wait(&mutex);
 		}
-		else if (deviceChanges > 0) {
-			deviceChanges = 0;
-			mutex.unlock();
-			if (!scanDevices()) {
-				continue;
-			}
+		bool rescan = deviceChanges > 0;
+		bool reload = configChanged;
+		deviceChanges = 0;
+		configChanged = false;
+		mutex.unlock();
+
+		if (rescan) {
+			scanDevices();
+			publishRemotes();
 		}
-		else {
-			mutex.unlock();
+		if (reload) {
+			nh_log("reloading configuration");
+			for (auto it = devices.begin(); it != devices.end(); ++it) {
+				loadConfig(it.value());
+			}
 		}
 
 		/* Bluetooth heartbeat to prevent Bluetooth from turning off */
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		if (last_event.tv_sec > 0 &&
-		    now.tv_sec - last_event.tv_sec < BLUETOOTH_TIMEOUT) {
+		if (lastEvent > 0 &&
+		    nowMs() - lastEvent < BLUETOOTH_TIMEOUT * 1000) {
 			if (bluetoothHeartbeat == NULL) {
 				bluetoothHeartbeat = alloca(1024);
 				new(bluetoothHeartbeat) QObject();
@@ -297,13 +401,17 @@ void BluetoothPageTurner::run()
 			BluetoothHeartbeat_beat(bluetoothHeartbeat);
 		}
 
+		if (devices.empty()) {
+			continue;
+		}
+
 		/* Poll devices for input events */
 		tv.tv_sec = 1;
 		tv.tv_usec = 0;
 
 		FD_ZERO(&rfds);
 
-		foreach(const Device &device, devices.values()) {
+		foreach (const Device &device, devices) {
 			FD_SET(device.fd, &rfds);
 		}
 
@@ -313,6 +421,7 @@ void BluetoothPageTurner::run()
 		}
 
 		/* Process events for each device */
+		bool lostAny = false;
 		for (auto it = devices.begin(); it != devices.end();) {
 			Device &device = it.value();
 
@@ -321,42 +430,40 @@ void BluetoothPageTurner::run()
 				continue;
 			}
 
-			ret = read(device.fd, &e, sizeof(e));
-			if (ret < (int)sizeof(e)) {
-				nh_log("lost device");
-				it = devices.erase(it);
-				continue;
-			}
-
-			if (e.type == 0x00 &&
-			    e.code == 0x00 &&
-			    e.value == 0x0001) {
-				nh_log("lost device");
-				it = devices.erase(it);
-				continue;
-			}
-
-			for (int i = 0; i < device.cfg.size(); i++) {
-				auto &pair = device.cfg[i];
-				struct input_event test = pair.first;
-				if (e.type == test.type &&
-				    e.code == test.code &&
-				    e.value == test.value) {
-					/* Update Bluetooth heartbeat time */
-					clock_gettime(CLOCK_MONOTONIC,
-					              &last_event);
-
-					/* Update PowerManager::timeLastUsed */
-					emit notify();
-
-					/* Invoke the configured method */
-					QByteArray method = pair.second.toLatin1();
-					invokeMainWindowController(
-						method.constData());
+			/* Drain everything queued, so a burst of events from
+			 * one press is handled together */
+			bool lost = false;
+			while (1) {
+				ret = read(device.fd, &e, sizeof(e));
+				if (ret < 0 && errno == EAGAIN) {
+					break;
 				}
+				if (ret < (int)sizeof(e)) {
+					lost = true;
+					break;
+				}
+				if (e.type == 0x00 &&
+				    e.code == 0x00 &&
+				    e.value == 0x0001) {
+					lost = true;
+					break;
+				}
+				handleEvent(device, e);
+			}
+
+			if (lost) {
+				nh_log("lost device %s", qPrintable(device.handler));
+				close(device.fd);
+				it = devices.erase(it);
+				lostAny = true;
+				continue;
 			}
 
 			it++;
+		}
+
+		if (lostAny) {
+			publishRemotes();
 		}
 	}
 }
@@ -369,6 +476,7 @@ void TimeLastUsedUpdater::notify()
 	QObject *pm = PowerManager_sharedInstance();
 	if (pm == NULL) {
 		nh_log("invalid PowerManager");
+		return;
 	}
 
 	PowerManager_filter(pm, this, &timeEvent);
@@ -389,6 +497,20 @@ static int btpt_init()
 	QObject::connect(
 		btpt, &QThread::finished,
 		timeLastUsedUpdater, &QObject::deleteLater);
+
+	SettingsLauncher *launcher = new SettingsLauncher(btpt);
+	QObject::connect(
+		btpt, &BluetoothPageTurner::openSettings,
+		launcher, &SettingsLauncher::open,
+		Qt::QueuedConnection);
+	QObject::connect(
+		btpt, &BluetoothPageTurner::unconfiguredInput,
+		launcher, &SettingsLauncher::offerSetup,
+		Qt::QueuedConnection);
+	QObject::connect(
+		btpt, &QThread::finished,
+		launcher, &QObject::deleteLater);
+
 	btpt->start();
 
 	return 0;

@@ -8,10 +8,11 @@ don't see why it wouldn't work on other Nickel devices.
 
 Copy `KoboRoot.tgz` into the `.kobo` folder of your eReader and eject it.
 
-After it installs, you'll see a `.btpt` folder on the device.  Add
-configuration files for your Bluetooth devices there, and connect to them using
-the standard Kobo Bluetooth settings menu.  You can now use the configured
-buttons to change pages in the reading view.
+After it installs, you'll see a `.btpt` folder on the device.  Connect your
+remote using the standard Kobo Bluetooth settings menu, and press one of its
+buttons: the settings screen opens so you can choose what its buttons do (see
+below).  You can also write configuration files by hand.  Then use the buttons
+to change pages in the reading view.
 
 To uninstall it, create a file in `.btpt` called `uninstall` and restart the
 device.
@@ -26,6 +27,43 @@ The Qt 6 build has been tested on a Kobo Libra Colour with firmware
 6.0.279225.  A Kobo firmware update replaces the system files, so reinstall
 `Kobo.tgz` after updating.  On that firmware, the chapter methods are
 `goToNextChapter` and `goToPrevChapter`.
+
+### Settings screen
+
+The first time a remote without a configuration file sends a button press, a
+full-screen settings page opens over Nickel.  For each action (next and
+previous page, next and previous chapter):
+
+* Tap **Add**, then press the button you want for it.  You can add more than
+  one button per action.  A button can only do one thing, so mapping it to a
+  new action removes it from the old one.
+* Tap **Clear** to remove an action's buttons.
+
+When you're not adding a button, pressing one shows what it does, which is a
+quick way to check a mapping.  Pages don't turn while the screen is open.
+
+**Ignore repeat presses within** sets the debounce (see below).  **This isn't a
+page turner** is for keyboards and other devices that shouldn't be set up;
+the screen won't open for them again.  With more than one remote connected,
+pressing a button on one switches to it, or use **Next remote**.
+
+Changes are saved to the remote's file in `.btpt` (named after its Bluetooth
+address) and take effect immediately.
+
+Some remotes send several events for one press.  A ring that acts like a
+touchscreen, for example, sends a touch and a series of positions for every
+swipe.  The screen picks the event most specific to the button, and if two
+buttons turn out to share it (two swipes that start in the same place), it
+picks again when you map the second one, and says so.
+
+To open the settings screen at any time, create a file called `open-settings`
+in `.btpt`.  With [NickelMenu][4], add this to a file in `.adds/nm` to put it
+in the reading and main menus:
+
+```
+menu_item:reader:Page turner:cmd_spawn:quiet:touch /mnt/onboard/.btpt/open-settings
+menu_item:main:Page turner:cmd_spawn:quiet:touch /mnt/onboard/.btpt/open-settings
+```
 
 ### Configuration
 
@@ -53,7 +91,26 @@ choices, but I'm not sure if any other methods make sense here.
 
 `TYPE`, `CODE`, and `VALUE` specify the input event values to match.  C-style
 integers in decimal, octal, or hexadecimal are accepted, and so are #defines
-from `<linux/input-event-codes.h>`. 
+from `<linux/input-event-codes.h>`.
+
+Lines starting with `#` are comments, as is anything after a `#` on a line.
+Lines that can't be read are skipped (and logged).
+
+Changes to configuration files take effect immediately; there's no need to
+reconnect the remote.
+
+#### Debounce
+
+Some remotes send more than one matching event for a single press, turning two
+pages at once.  A line like
+
+```
+debounce 250
+```
+
+ignores further matches from the same remote for that many milliseconds after
+one turns a page.  Without it there's no debounce.  Remotes set up on the
+settings screen start at 250.
 
 [0]: https://www.kernel.org/doc/html/v4.14/input/event-codes.html
 [1]: https://cgit.freedesktop.org/evtest/
@@ -120,3 +177,4 @@ This builds `Kobo.tgz`, which installs `libbtpt.so` into
 
 [2]: https://github.com/open-source-arena/Nickelite
 [3]: https://github.com/nicoverbruggen/NickelMenu/tree/qt6-support/toolchain/qt6
+[4]: https://pgaskin.net/NickelMenu/
