@@ -113,6 +113,21 @@ BluetoothPageTurner::BluetoothPageTurner()
 		this, &BluetoothPageTurner::watchConfig);
 	rewatchTimer.start(30 * 1000);
 	watchConfig();
+
+	/* Don't look for the open-settings file until Nickel is up and the
+	 * settings launcher is connected, so a file left there at startup
+	 * still opens the screen */
+	startupTimer.setSingleShot(true);
+	QObject::connect(
+		&startupTimer, &QTimer::timeout,
+		this, &BluetoothPageTurner::startWatchingTrigger);
+	startupTimer.start(15 * 1000);
+}
+
+void BluetoothPageTurner::startWatchingTrigger()
+{
+	triggerReady = true;
+	watchConfig();
 }
 
 QList<RemoteInfo> BluetoothPageTurner::remotes()
@@ -150,7 +165,8 @@ void BluetoothPageTurner::configChangedOnDisk(const QString &path)
 
 void BluetoothPageTurner::watchConfig()
 {
-	if (QFile::exists(BTPT_OPEN_SETTINGS)) {
+	if (triggerReady && QFile::exists(BTPT_OPEN_SETTINGS) &&
+	    nickelMainWindow()) {
 		QFile::remove(BTPT_OPEN_SETTINGS);
 		emit openSettings(QString());
 	}

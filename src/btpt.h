@@ -86,11 +86,14 @@ private:
 	QFileSystemWatcher inputWatcher;
 	QFileSystemWatcher configWatcher;
 	QTimer rewatchTimer;
+	QTimer startupTimer;
+	bool triggerReady = false;
 
 public slots:
 	void inputDirectoryChanged(const QString &path);
 	void configChangedOnDisk(const QString &path);
 	void watchConfig();
+	void startWatchingTrigger();
 
 signals:
 	void notify();
