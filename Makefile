@@ -3,7 +3,7 @@ NICKELHOOK ?= NickelHook/
 include $(NICKELHOOK)NickelHook.mk
 
 override LIBRARY  := libbtpt.so
-override SOURCES  += src/btpt.cc src/eventcodes.cc src/config.cc src/capture.cc src/settings.cc
+override SOURCES  += src/btpt.cc src/eventcodes.cc src/config.cc src/capture.cc src/settings.cc src/actions.cc
 override CFLAGS   += -Wall -Wextra -Werror
 override CXXFLAGS += -Wall -Wextra -Werror -Wno-missing-field-initializers
 ifeq ($(NH_QT_MAJOR),5)

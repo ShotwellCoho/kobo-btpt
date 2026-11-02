@@ -15,6 +15,7 @@
 
 #include <NickelHook.h>
 
+#include "actions.h"
 #include "btpt.h"
 #include "eventcodes.h"
 #include "settings.h"
@@ -212,10 +213,21 @@ void SettingsScreen::build()
 	methods << "nextChapter" << "prevChapter";
 #endif
 	labels << "Next chapter" << "Previous chapter";
+	/* Device actions, which work in any view */
+	int firstDeviceAction = methods.size();
+	methods << "nickel:sleep" << "nickel:nightMode" << "nickel:rotate";
+	labels << "Sleep" << "Night mode" << "Rotate screen";
 
 	grid = new QGridLayout();
 	grid->setColumnStretch(0, 1);
+	int row = 0;
 	for (int i = 0; i < methods.size(); i++) {
+		if (i == firstDeviceAction) {
+			QLabel *heading = new QLabel("Anywhere, not only in books", this);
+			heading->setObjectName("small");
+			grid->addWidget(heading, row++, 0, 1, 3);
+		}
+
 		Action a;
 		a.method = methods[i];
 		a.label = labels[i];
@@ -230,18 +242,19 @@ void SettingsScreen::build()
 		text->setSpacing(0);
 		text->addWidget(label);
 		text->addWidget(a.bindings);
-		grid->addLayout(text, i, 0);
+		grid->addLayout(text, row, 0);
 
 		a.add = new QPushButton("Add", this);
 		a.add->setProperty("action", i);
 		connect(a.add, &QPushButton::clicked, this, &SettingsScreen::onAdd);
-		grid->addWidget(a.add, i, 1);
+		grid->addWidget(a.add, row, 1);
 
 		a.clear = new QPushButton("Clear", this);
 		a.clear->setProperty("action", i);
 		connect(a.clear, &QPushButton::clicked,
 		        this, &SettingsScreen::onClear);
-		grid->addWidget(a.clear, i, 2);
+		grid->addWidget(a.clear, row, 2);
+		row++;
 
 		actions.append(a);
 	}
@@ -787,6 +800,12 @@ void SettingsLauncher::show(const QString &uniq, bool newRemote)
 		nh_log("no main window for settings");
 		return;
 	}
+	/* List what else the reading view can do, for mapping by hand */
+	QWidget *view = nickelCurrentView();
+	if (view && view->objectName() == "ReadingView") {
+		dumpMethods(view);
+	}
+
 	screen = new SettingsScreen(btpt, window, uniq, newRemote);
 	screen->show();
 	screen->raise();

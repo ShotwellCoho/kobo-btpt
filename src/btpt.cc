@@ -22,6 +22,7 @@
 #include <QTextStream>
 #include <QThread>
 
+#include "actions.h"
 #include "btpt.h"
 #include "capture.h"
 #include "config.h"
@@ -48,7 +49,7 @@ static qint64 nowMs()
 	return (qint64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static QWidget *currentView()
+QWidget *nickelCurrentView()
 {
 	void *mwc = MainWindowController_sharedInstance();
 	if (!mwc) {
@@ -64,7 +65,7 @@ static QWidget *currentView()
 
 QWidget *nickelMainWindow()
 {
-	QWidget *cv = currentView();
+	QWidget *cv = nickelCurrentView();
 	if (cv) {
 		return cv->window();
 	}
@@ -73,7 +74,7 @@ QWidget *nickelMainWindow()
 
 static void invokeMainWindowController(const char *method)
 {
-	QWidget *cv = currentView();
+	QWidget *cv = nickelCurrentView();
 	if (!cv) {
 		return;
 	}
@@ -345,8 +346,15 @@ void BluetoothPageTurner::handleEvent(Device &device, const struct input_event &
 		emit notify();
 
 		/* Invoke the configured method */
-		QByteArray method = m.method.toLatin1();
-		invokeMainWindowController(method.constData());
+		if (isDeviceAction(m.method)) {
+			/* Runs in the GUI thread */
+			nh_log("%s", qPrintable(m.method));
+			emit deviceAction(m.method);
+		}
+		else {
+			QByteArray method = m.method.toLatin1();
+			invokeMainWindowController(method.constData());
+		}
 	}
 }
 
@@ -499,6 +507,10 @@ static int btpt_init()
 		timeLastUsedUpdater, &QObject::deleteLater);
 
 	SettingsLauncher *launcher = new SettingsLauncher(btpt);
+	QObject::connect(
+		btpt, &BluetoothPageTurner::deviceAction,
+		launcher, [](const QString &method) { runDeviceAction(method); },
+		Qt::QueuedConnection);
 	QObject::connect(
 		btpt, &BluetoothPageTurner::openSettings,
 		launcher, &SettingsLauncher::open,

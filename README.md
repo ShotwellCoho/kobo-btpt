@@ -32,7 +32,7 @@ The Qt 6 build has been tested on a Kobo Libra Colour with firmware
 
 The first time a remote without a configuration file sends a button press, a
 full-screen settings page opens over Nickel.  For each action (next and
-previous page, next and previous chapter):
+previous page, next and previous chapter, and the device actions below):
 
 * Tap **Add**, then press the button you want for it.  You can add more than
   one button per action.  A button can only do one thing, so mapping it to a
@@ -56,6 +56,10 @@ swipe.  The screen picks the event most specific to the button, and if two
 buttons turn out to share it (two swipes that start in the same place), it
 picks again when you map the second one, and says so.
 
+Opening the screen while reading also writes `.btpt/methods.txt`, a list of
+everything Nickel's reading view can be asked to do, for mapping by hand (see
+`METHOD` below).
+
 To open the settings screen at any time, create a file called `open-settings`
 in `.btpt`.  With [NickelMenu][4], add this to a file in `.adds/nm` to put it
 in the reading and main menus:
@@ -64,6 +68,25 @@ in the reading and main menus:
 menu_item:reader:Page turner:cmd_spawn:quiet:touch /mnt/onboard/.btpt/open-settings
 menu_item:main:Page turner:cmd_spawn:quiet:touch /mnt/onboard/.btpt/open-settings
 ```
+
+### Device actions
+
+As well as turning pages, a button can:
+
+| `METHOD`           | Does                                                  |
+| ------------------ | ----------------------------------------------------- |
+| `nickel:sleep`     | Puts the Kobo to sleep                                |
+| `nickel:nightMode` | Toggles dark mode (or invert, on firmware before 4.28) |
+| `nickel:rotate`    | Swaps between portrait and landscape                  |
+
+These work anywhere, not only while reading.  They use the same Nickel
+functions as [NickelMenu][4]'s `power:sleep`, `nickel_setting:toggle:dark_mode`
+and `nickel_orientation:swap` actions, and if the firmware doesn't have what
+they need, they do nothing and log why.
+
+The Kobo turns Bluetooth off while it sleeps, so a remote can put it to sleep
+but can't wake it up.  Rotation only takes effect in views that allow
+landscape; see NickelMenu's notes on `nickel_orientation` if it does nothing.
 
 ### Configuration
 
@@ -85,7 +108,8 @@ The file should have a line for each input mapping in the format:
 METHOD TYPE CODE VALUE
 ```
 
-`METHOD` is the name of the ReadingView method to invoke.  `prevPage` and
+`METHOD` is the name of the ReadingView method to invoke, or one of the device
+actions above.  `prevPage` and
 `nextPage` turn the pages.  `prevChapter` and `nextChapter` are also valid
 choices, but I'm not sure if any other methods make sense here.
 

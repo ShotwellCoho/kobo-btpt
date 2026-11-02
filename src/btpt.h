@@ -94,6 +94,7 @@ public slots:
 
 signals:
 	void notify();
+	void deviceAction(const QString &method);
 	void openSettings(const QString &uniq);
 	void inputEvent(const QString &uniq, const QString &name,
 	                int type, int code, int value,
@@ -112,5 +113,8 @@ public slots:
 
 /* Nickel's main window, to show the settings screen over */
 QWidget *nickelMainWindow();
+
+/* The view Nickel is showing, such as ReadingView */
+QWidget *nickelCurrentView();
 
 #endif /* BTPT_H */
